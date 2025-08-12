@@ -75,35 +75,43 @@ def capture_audio_segment():
         stream.close()
         p.terminate()
 
+import io
+
 def process_audio_segment(audio_data):
-    """Send audio segment to backend for processing"""
+    """Send audio segment to backend for processing using in-memory buffer"""
     unique_id = uuid.uuid4().hex
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{timestamp}_{unique_id}.wav"
     
-    # Save temporary audio file
-    with wave.open(filename, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
-        wf.setframerate(RATE)
-        wf.writeframes(audio_data)
-    
-    # Send to backend
     try:
-        with open(filename, 'rb') as f:
-            response = requests.post(
-                "http://localhost:5000/process",
-                files={'audio': (filename, f, 'audio/wav')}
-            )
+        # Create in-memory WAV file
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
+            wf.setframerate(RATE)
+            wf.writeframes(audio_data)
+        
+        # Reset buffer position to start
+        wav_buffer.seek(0)
+        
+        # Send to backend
+        response = requests.post(
+            "http://localhost:5000/process",
+            files={'audio': (filename, wav_buffer, 'audio/wav')}
+        )
+        
         if response.status_code == 200:
             print(f"Processed audio segment: {response.json()['response']}")
         else:
             print(f"Error processing audio: {response.text}")
+            
     except Exception as e:
         print(f"Error sending audio to backend: {str(e)}")
+        
     finally:
-        # Clean up temporary file
-        os.remove(filename)
+        # Close buffer to free memory
+        wav_buffer.close()
 
 if __name__ == "__main__":
     capture_audio_segment()
