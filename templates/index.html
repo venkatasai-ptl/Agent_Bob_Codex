@@ -55,23 +55,76 @@
 <body>
     <h1>System Audio to LLM</h1>
     <div class="status" id="status">Listening for system audio...</div>
-    <div id="output"></div>
 
+    <!-- Current Response Section -->
+    <div class="current-response">
+        <h2>Current Response</h2>
+        <div id="currentOutput"></div>
+    </div>
+
+    <!-- Historical Responses Section -->
+    <div class="historical-responses">
+        <h2>Historical Responses</h2>
+        <div id="historyOutput"></div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
     <script>
-        const outputDiv = document.getElementById('output');
+        // Initialize Socket.IO connection
+        const socket = io();
+
+        const currentOutputDiv = document.getElementById('currentOutput');
+        const historyOutputDiv = document.getElementById('historyOutput');
         const statusDiv = document.getElementById('status');
 
-        // Function to fetch and display responses
+        // Listen for clear event
+        socket.on('clear', function () {
+            currentOutputDiv.textContent = '';
+        });
+
+        // Listen for token events
+        socket.on('token', function (data) {
+            currentOutputDiv.textContent += data.token;
+            currentOutputDiv.scrollTop = currentOutputDiv.scrollHeight;
+        });
+
+        // Listen for completion event
+        socket.on('complete', function () {
+            statusDiv.textContent = 'Response complete!';
+            fetchResponses();
+        });
+
+        // Function to simulate audio capture
+        async function simulateAudioCapture() {
+            statusDiv.textContent = 'Simulating audio capture...';
+            currentOutputDiv.textContent = '';
+
+            try {
+                // Trigger audio capture simulation
+                const response = await fetch('/simulate-capture', {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Server error: ${response.status}`);
+                }
+            } catch (error) {
+                console.error('Error simulating audio capture:', error);
+                statusDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+
+        // Function to fetch and display historical responses
         function fetchResponses() {
             fetch('/get_responses')
                 .then(response => response.json())
                 .then(responses => {
-                    outputDiv.innerHTML = '';
+                    historyOutputDiv.innerHTML = '';
                     responses.forEach(resp => {
                         const div = document.createElement('div');
                         div.className = 'response';
                         div.innerHTML = `<strong>${resp.timestamp}:</strong> ${resp.text}`;
-                        outputDiv.appendChild(div);
+                        historyOutputDiv.appendChild(div);
                     });
                 })
                 .catch(error => {
@@ -79,9 +132,26 @@
                 });
         }
 
-        // Fetch responses every 3 seconds
-        setInterval(fetchResponses, 3000);
+        // Add a button to simulate audio capture for demo purposes
+        const simulateButton = document.createElement('button');
+        simulateButton.id = 'simulateAudio';
+        simulateButton.textContent = 'Simulate Audio Capture';
+        simulateButton.style.margin = '20px 0';
+        simulateButton.style.padding = '10px 20px';
+        simulateButton.style.background = '#007bff';
+        simulateButton.style.color = 'white';
+        simulateButton.style.border = 'none';
+        simulateButton.style.borderRadius = '5px';
+        simulateButton.style.cursor = 'pointer';
+
+        document.body.appendChild(simulateButton);
+        simulateButton.addEventListener('click', simulateAudioCapture);
+
+        // Initial fetch of historical responses
+        fetchResponses();
     </script>
 </body>
+
+</html>
 
 </html>
