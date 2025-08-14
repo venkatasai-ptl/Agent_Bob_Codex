@@ -1,4 +1,4 @@
-import pyaudio
+import pyaudiowpatch as pyaudio
 import wave
 import webrtcvad
 import time
@@ -6,6 +6,7 @@ import requests
 import os
 from datetime import datetime
 import uuid
+import audioop  # stdlib resampling
 
 # Audio configuration
 FORMAT = pyaudio.paInt16
@@ -17,49 +18,15 @@ VAD_AGGRESSIVENESS = 3
 SILENCE_TIMEOUT = 2  # seconds of silence to consider speech ended
 
 def find_loopback_device(p):
-    """Find WASAPI loopback device for system audio capture"""
-    # Prefer WASAPI loopback devices
-    wasapi_devices = []
-    
-    for i in range(p.get_device_count()):
-        try:
-            dev_info = p.get_device_info_by_index(i)
-            # Look for WASAPI loopback devices
-            if 'WASAPI' in dev_info['hostApiName'] and 'loopback' in dev_info['name'].lower():
-                wasapi_devices.append((i, dev_info))
-        except:
-            continue
-    
-    # Prefer devices with stereo support
-    for i, dev in wasapi_devices:
-        if dev['maxInputChannels'] >= 2:
-            return i
-    
-    # Fallback to first WASAPI device if no stereo
-    if wasapi_devices:
-        return wasapi_devices[0][0]
-    
-    # Final fallback: look for any loopback device
-    for i in range(p.get_device_count()):
-        dev_info = p.get_device_info_by_index(i)
-        if 'loopback' in dev_info['name'].lower() and dev_info['maxInputChannels'] > 0:
-            return i
-    
+    """Return the WASAPI default OUTPUT device index for loopback capture."""
+    for h in range(p.get_host_api_count()):
+        hai = p.get_host_api_info_by_index(h)
+        if 'wasapi' in hai['name'].lower():
+            idx = hai.get('defaultOutputDevice', -1)
+            return idx if idx != -1 else None
     return None
 
-def convert_stereo_to_mono(data):
-    """Convert stereo audio (2 channels) to mono"""
-    # Each sample is 2 bytes (16-bit), stereo has 2 channels
-    mono_data = bytearray()
-    for i in range(0, len(data), 4):
-        # Extract left and right channels (16-bit samples)
-        left = int.from_bytes(data[i:i+2], 'little', signed=True)
-        right = int.from_bytes(data[i+2:i+4], 'little', signed=True)
-        # Average channels
-        mono_sample = (left + right) // 2
-        # Convert back to bytes
-        mono_data.extend(mono_sample.to_bytes(2, 'little', signed=True))
-    return bytes(mono_data)
+
 
 def capture_audio_segment():
     """Capture audio segments with VAD and send to backend"""
@@ -91,24 +58,19 @@ def capture_audio_segment():
                     print(f"Error getting device info for index {i}: {str(e)}")
             return
     
-    # Try to open WASAPI loopback
-    try:
-        stream = p.open(format=FORMAT,
-                        channels=2,  # WASAPI loopback is always stereo
-                        rate=RATE,
-                        input=True,
-                        frames_per_buffer=CHUNK_SIZE,
-                        as_loopback=True)
-        print("Using WASAPI loopback for system audio capture")
-    except Exception as e:
-        print(f"Error opening WASAPI loopback: {str(e)}")
-        print("Falling back to standard device")
-        stream = p.open(format=FORMAT,
-                        channels=CHANNELS,
-                        rate=RATE,
-                        input=True,
-                        input_device_index=device_index,
-                        frames_per_buffer=CHUNK_SIZE)
+    # Use default input device with standard parameters
+    print("Using default input device with standard parameters")
+    
+    stream = p.open(
+        format=FORMAT,
+        channels=1,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK_SIZE
+    )
+    stream_channels = 1
+    device_rate = RATE
+    frames_per_buffer = CHUNK_SIZE
     
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
     frames = []
@@ -118,32 +80,52 @@ def capture_audio_segment():
     
     print("Listening for system audio...")
     
+    # Initialize resampler state and buffer
+    resample_state = None
+    vad_buf = bytearray()
+    
     try:
         while True:
-            chunk = stream.read(CHUNK_SIZE)
-            # Convert to mono if needed (VAD requires mono audio)
-            if CHANNELS == 2:
-                mono_chunk = convert_stereo_to_mono(chunk)
+            chunk = stream.read(frames_per_buffer, exception_on_overflow=False)
+            
+            # Convert to mono based on stream's actual channel count
+            if stream_channels == 2:
+                mono_16le = audioop.tomono(chunk, 2, 0.5, 0.5)
             else:
-                mono_chunk = chunk
+                mono_16le = chunk
             
-            is_speech = vad.is_speech(mono_chunk, RATE)
+            # Resample to 16kHz with persistent state
+            if device_rate != 16000:
+                mono_16k, resample_state = audioop.ratecv(
+                    mono_16le, 2, 1, device_rate, 16000, resample_state
+                )
+            else:
+                mono_16k = mono_16le
             
-            if is_speech:
-                frames.append(chunk)
-                speech_detected = True
-                silence_count = 0
-            elif speech_detected:
-                frames.append(chunk)
-                silence_count += 1
+            # Accumulate and slice into exact 30ms frames (960 bytes)
+            vad_buf.extend(mono_16k)
+            
+            while len(vad_buf) >= 960:
+                frame = bytes(vad_buf[:960])
+                del vad_buf[:960]
                 
-                # If we've had enough silence, consider speech ended
-                if silence_count * CHUNK_DURATION / 1000 >= SILENCE_TIMEOUT:
-                    # Process the audio segment
-                    process_audio_segment(b''.join(frames))
-                    frames = []
-                    speech_detected = False
+                is_speech = vad.is_speech(frame, 16000)
+                
+                if is_speech:
+                    frames.append(frame)  # Store mono@16k
+                    speech_detected = True
                     silence_count = 0
+                elif speech_detected:
+                    frames.append(frame)
+                    silence_count += 1
+                    
+                    # If we've had enough silence, consider speech ended
+                    if silence_count * CHUNK_DURATION / 1000 >= SILENCE_TIMEOUT:
+                        # Process the audio segment
+                        process_audio_segment(b''.join(frames))
+                        frames.clear()
+                        speech_detected = False
+                        silence_count = 0
     except KeyboardInterrupt:
         print("Stopping capture")
     finally:
@@ -160,19 +142,13 @@ def process_audio_segment(audio_data):
     filename = f"{timestamp}_{unique_id}.wav"
     
     try:
-        # Create in-memory WAV file (always mono for Whisper)
+        # Create in-memory WAV file (mono@16kHz)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wf:
-            wf.setnchannels(1)  # Whisper requires mono
-            wf.setsampwidth(pyaudio.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
-            
-            # Convert to mono if needed
-            if CHANNELS == 2:
-                mono_data = convert_stereo_to_mono(audio_data)
-                wf.writeframes(mono_data)
-            else:
-                wf.writeframes(audio_data)
+            wf.setnchannels(1)  # Mono
+            wf.setsampwidth(2)  # 16-bit samples
+            wf.setframerate(16000)  # 16kHz
+            wf.writeframes(audio_data)  # Already processed
         
         # Reset buffer position to start
         wav_buffer.seek(0)
@@ -184,7 +160,7 @@ def process_audio_segment(audio_data):
         )
         
         if response.status_code == 200:
-            print(f"Processed audio segment: {response.json()['response']}")
+            print("Audio segment sent for processing")
         else:
             print(f"Error processing audio: {response.text}")
             

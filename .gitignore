@@ -21,5 +21,6 @@ Thumbs.db
 *.log
 
 # Virtual environments
+.venv/
 venv/
 env/

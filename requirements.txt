@@ -1,5 +1,7 @@
 flask
 openai
 python-dotenv
-pyaudio
+pyaudiowpatch
 webrtcvad
+flask-socketio
+requests

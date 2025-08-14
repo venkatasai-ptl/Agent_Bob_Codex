@@ -15,10 +15,11 @@ def get_llm_response(prompt, *,
                      system=INTERVIEW_SYSTEM_TEMPLATE,
                      model="gpt-3.5-turbo",
                      temperature=0.4,
-                     top_p=1.0):
+                     top_p=1.0,
+                     stream=False):
     """
     Get response from LLM using OpenAI GPT-3.5-turbo
-    Returns LLM response text
+    Returns LLM response text or generator for streaming
     """
     client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     response = client.chat.completions.create(
@@ -28,6 +29,15 @@ def get_llm_response(prompt, *,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        stream=stream
     )
-    return response.choices[0].message.content
+    
+    if stream:
+        # Return generator for streaming responses
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+    else:
+        # Return full response for non-streaming
+        return response.choices[0].message.content
