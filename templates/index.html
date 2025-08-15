@@ -2,8 +2,8 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Audio to LLM</title>
     <style>
         body {
@@ -12,13 +12,13 @@
             max-width: 800px;
         }
 
-        #output {
-            margin-top: 20px;
+        #currentOutput {
+            margin-top: 10px;
             padding: 10px;
             border: 1px solid #ccc;
             min-height: 100px;
             white-space: pre-wrap;
-            background-color: #f9f9f9;
+            background: #f9f9f9;
             border-radius: 5px;
         }
 
@@ -27,7 +27,7 @@
             font-style: italic;
             color: #666;
             padding: 5px;
-            background-color: #f0f0f0;
+            background: #f0f0f0;
             border-radius: 3px;
         }
 
@@ -49,11 +49,46 @@
             border-bottom: 2px solid #007bff;
             padding-bottom: 10px;
         }
+
+        .input-section textarea {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .btn {
+            margin: 20px 0;
+            padding: 10px 20px;
+            background: #007bff;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 
 <body>
-    <h1>System Audio to LLM</h1>
+    <h1>Agent Bob</h1>
+
+    <!-- Resume and Job Description Input Section -->
+    <div class="input-section">
+        <h2>Resume and Job Details</h2>
+        <div>
+            <label for="resume">Resume:</label>
+            <textarea id="resume" rows="8" placeholder="Paste your resume here..."></textarea>
+        </div>
+        <div>
+            <label for="jobDescription">Job Description:</label>
+            <textarea id="jobDescription" rows="8" placeholder="Paste job description here..."></textarea>
+        </div>
+        <button id="submitText" class="btn">Start Session</button>
+    </div>
+
     <div class="status" id="status">Listening for system audio...</div>
 
     <!-- Current Response Section -->
@@ -65,93 +100,111 @@
     <!-- Historical Responses Section -->
     <div class="historical-responses">
         <h2>Historical Responses</h2>
-        <div id="historyOutput"></div>
+        <div id="historyOutput"><em>No history yet.</em></div>
     </div>
+
 
     <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
     <script>
-        // Initialize Socket.IO connection
+        // Socket.IO connection
         const socket = io();
 
+        // Elements
         const currentOutputDiv = document.getElementById('currentOutput');
         const historyOutputDiv = document.getElementById('historyOutput');
         const statusDiv = document.getElementById('status');
+        const submitTextButton = document.getElementById('submitText');
 
-        // Listen for clear event
-        socket.on('clear', function () {
+        // Simple XSS-safe text escape
+        function escapeHtml(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        // Fetch and render the session chat history
+        function fetchChatHistory() {
+            if (!historyOutputDiv) return;
+            fetch('/get_chat_history')
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
+                .then(history => {
+                    historyOutputDiv.innerHTML = '';
+                    if (!Array.isArray(history) || history.length === 0) {
+                        historyOutputDiv.innerHTML = '<em>No history yet.</em>';
+                        return;
+                    }
+                    history.forEach(turn => {
+                        const div = document.createElement('div');
+                        div.className = 'response';
+                        div.innerHTML = `
+              <div><strong>${turn.timestamp || ''}</strong></div>
+              <div><strong>User:</strong> ${escapeHtml(turn.user || '')}</div>
+              <div><strong>Response:</strong> ${escapeHtml(turn.assistant || '')}</div>
+              <hr/>
+            `;
+                        historyOutputDiv.appendChild(div);
+                    });
+                })
+                .catch(err => {
+                    console.error('Error fetching chat history:', err);
+                });
+        }
+
+        // Socket events
+        socket.on('clear', () => {
             currentOutputDiv.textContent = '';
+            statusDiv.textContent = 'Processing...';
         });
 
-        // Listen for token events
-        socket.on('token', function (data) {
+        socket.on('token', (data) => {
             currentOutputDiv.textContent += data.token;
             currentOutputDiv.scrollTop = currentOutputDiv.scrollHeight;
         });
 
-        // Listen for completion event
-        socket.on('complete', function () {
+        socket.on('complete', () => {
             statusDiv.textContent = 'Response complete!';
-            fetchResponses();
+            fetchChatHistory(); // refresh history after each response
         });
 
-        // Function to simulate audio capture
-        async function simulateAudioCapture() {
-            statusDiv.textContent = 'Simulating audio capture...';
-            currentOutputDiv.textContent = '';
+
+        // Start Session
+        submitTextButton.addEventListener('click', async () => {
+            const resumeText = document.getElementById('resume').value.trim();
+            const jobDescriptionText = document.getElementById('jobDescription').value.trim();
+
+            if (!resumeText || !jobDescriptionText) {
+                alert('Please fill in both resume and job description fields.');
+                return;
+            }
 
             try {
-                // Trigger audio capture simulation
-                const response = await fetch('/simulate-capture', {
-                    method: 'POST'
+                submitTextButton.disabled = true;
+                const response = await fetch('/start-session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ resume: resumeText, job_description: jobDescriptionText })
                 });
 
-                if (!response.ok) {
-                    throw new Error(`Server error: ${response.status}`);
-                }
-            } catch (error) {
-                console.error('Error simulating audio capture:', error);
-                statusDiv.textContent = `Error: ${error.message}`;
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                console.log('Session started:', data);
+                statusDiv.textContent = 'Session started! You can now use the audio features.';
+                fetchChatHistory(); // show any prior history tied to this session
+            } catch (err) {
+                console.error('Error starting session:', err);
+                statusDiv.textContent = `Error: ${err.message}`;
+            } finally {
+                submitTextButton.disabled = false;
             }
-        }
+        });
 
-        // Function to fetch and display historical responses
-        function fetchResponses() {
-            fetch('/get_responses')
-                .then(response => response.json())
-                .then(responses => {
-                    historyOutputDiv.innerHTML = '';
-                    responses.forEach(resp => {
-                        const div = document.createElement('div');
-                        div.className = 'response';
-                        div.innerHTML = `<strong>${resp.timestamp}:</strong> ${resp.text}`;
-                        historyOutputDiv.appendChild(div);
-                    });
-                })
-                .catch(error => {
-                    console.error('Error fetching responses:', error);
-                });
-        }
+        // Bind simulate button
+        simulateBtn.addEventListener('click', simulateAudioCapture);
 
-        // Add a button to simulate audio capture for demo purposes
-        const simulateButton = document.createElement('button');
-        simulateButton.id = 'simulateAudio';
-        simulateButton.textContent = 'Simulate Audio Capture';
-        simulateButton.style.margin = '20px 0';
-        simulateButton.style.padding = '10px 20px';
-        simulateButton.style.background = '#007bff';
-        simulateButton.style.color = 'white';
-        simulateButton.style.border = 'none';
-        simulateButton.style.borderRadius = '5px';
-        simulateButton.style.cursor = 'pointer';
-
-        document.body.appendChild(simulateButton);
-        simulateButton.addEventListener('click', simulateAudioCapture);
-
-        // Initial fetch of historical responses
-        fetchResponses();
+        // Initial load
+        document.addEventListener('DOMContentLoaded', fetchChatHistory);
     </script>
 </body>
-
-</html>
 
 </html>
