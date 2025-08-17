@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Audio to LLM</title>
+    <title>Agent Bob</title>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -69,11 +69,31 @@
             opacity: 0.6;
             cursor: not-allowed;
         }
+
+        .session-pill {
+            display: inline-block;
+            margin-left: 10px;
+            padding: 4px 8px;
+            font-size: 12px;
+            background: #eef6ff;
+            border: 1px solid #bcd8ff;
+            border-radius: 12px;
+            color: #275ea3;
+            vertical-align: middle;
+            max-width: 360px;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            white-space: nowrap;
+        }
     </style>
 </head>
 
 <body>
-    <h1>Agent Bob</h1>
+    <h1>
+        Agent Bob
+        <span id="sessionPill" class="session-pill" title="Session ID will appear after starting a session">no
+            session</span>
+    </h1>
 
     <!-- Resume and Job Description Input Section -->
     <div class="input-section">
@@ -103,52 +123,92 @@
         <div id="historyOutput"><em>No history yet.</em></div>
     </div>
 
-
     <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
     <script>
-        // Socket.IO connection
-        const socket = io();
+        // ---- session state ----
+        const LS_KEY = 'agent_bob_session_id';
+        let SESSION_ID = localStorage.getItem(LS_KEY) || null;
+
+        // ---- Socket.IO ----
+        // (we don't need cookies if we pass session_id explicitly for API calls,
+        // but leaving withCredentials true is fine)
+        const socket = io({ withCredentials: true });
 
         // Elements
         const currentOutputDiv = document.getElementById('currentOutput');
         const historyOutputDiv = document.getElementById('historyOutput');
         const statusDiv = document.getElementById('status');
         const submitTextButton = document.getElementById('submitText');
+        const sessionPill = document.getElementById('sessionPill');
 
         // Simple XSS-safe text escape
         function escapeHtml(s) {
-            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function setSessionId(sid) {
+            SESSION_ID = sid;
+            if (sid) {
+                localStorage.setItem(LS_KEY, sid);
+                sessionPill.textContent = sid;
+                sessionPill.title = sid;
+            } else {
+                localStorage.removeItem(LS_KEY);
+                sessionPill.textContent = 'no session';
+                sessionPill.title = 'Session ID will appear after starting a session';
+            }
         }
 
         // Fetch and render the session chat history
-        function fetchChatHistory() {
+        async function fetchChatHistory() {
             if (!historyOutputDiv) return;
-            fetch('/get_chat_history')
-                .then(r => {
-                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                    return r.json();
-                })
-                .then(history => {
-                    historyOutputDiv.innerHTML = '';
-                    if (!Array.isArray(history) || history.length === 0) {
-                        historyOutputDiv.innerHTML = '<em>No history yet.</em>';
-                        return;
+
+            // If we don't have a session yet, show helpful message
+            if (!SESSION_ID) {
+                historyOutputDiv.innerHTML = '<em>No session. Start a session to see history.</em>';
+                return;
+            }
+
+            try {
+                const res = await fetch('/get_chat_history', {
+                    method: 'GET',
+                    headers: {
+                        'X-Session-Id': SESSION_ID // ✅ pass session explicitly
                     }
-                    history.forEach(turn => {
-                        const div = document.createElement('div');
-                        div.className = 'response';
-                        div.innerHTML = `
-              <div><strong>${turn.timestamp || ''}</strong></div>
-              <div><strong>User:</strong> ${escapeHtml(turn.user || '')}</div>
-              <div><strong>Response:</strong> ${escapeHtml(turn.assistant || '')}</div>
-              <hr/>
-            `;
-                        historyOutputDiv.appendChild(div);
-                    });
-                })
-                .catch(err => {
-                    console.error('Error fetching chat history:', err);
                 });
+                const data = await res.json();
+
+                if (!res.ok) {
+                    // Server may return {error: "..."} with 400 if no/invalid session
+                    const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+                    historyOutputDiv.innerHTML = `<em>${escapeHtml(msg)}</em>`;
+                    return;
+                }
+
+                const history = Array.isArray(data) ? data : [];
+                historyOutputDiv.innerHTML = '';
+                if (history.length === 0) {
+                    historyOutputDiv.innerHTML = '<em>No history yet.</em>';
+                    return;
+                }
+                history.forEach(turn => {
+                    const div = document.createElement('div');
+                    div.className = 'response';
+                    div.innerHTML = `
+            <div><strong>${escapeHtml(turn.timestamp || '')}</strong></div>
+            <div><strong>User:</strong> ${escapeHtml(turn.user || '')}</div>
+            <div><strong>Response:</strong> ${escapeHtml(turn.assistant || '')}</div>
+            <hr/>
+          `;
+                    historyOutputDiv.appendChild(div);
+                });
+            } catch (err) {
+                console.error('Error fetching chat history:', err);
+                historyOutputDiv.innerHTML = `<em>Error fetching history: ${escapeHtml(err.message)}</em>`;
+            }
         }
 
         // Socket events
@@ -166,7 +226,6 @@
             statusDiv.textContent = 'Response complete!';
             fetchChatHistory(); // refresh history after each response
         });
-
 
         // Start Session
         submitTextButton.addEventListener('click', async () => {
@@ -186,24 +245,31 @@
                     body: JSON.stringify({ resume: resumeText, job_description: jobDescriptionText })
                 });
 
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
-                console.log('Session started:', data);
+                if (!response.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+
+                // Save and display session id
+                setSessionId(data.session_id);
+                console.log('Session started:', data.session_id);
                 statusDiv.textContent = 'Session started! You can now use the audio features.';
-                fetchChatHistory(); // show any prior history tied to this session
+
+                // Reset the chat history display for the new session
+                historyOutputDiv.innerHTML = '<em>No history yet.</em>';
+                fetchChatHistory();
             } catch (err) {
                 console.error('Error starting session:', err);
                 statusDiv.textContent = `Error: ${err.message}`;
+                setSessionId(null);
             } finally {
                 submitTextButton.disabled = false;
             }
         });
 
-        // Bind simulate button
-        simulateBtn.addEventListener('click', simulateAudioCapture);
-
-        // Initial load
-        document.addEventListener('DOMContentLoaded', fetchChatHistory);
+        // On load: show any existing session id and try to fetch history
+        document.addEventListener('DOMContentLoaded', () => {
+            setSessionId(SESSION_ID);
+            fetchChatHistory();
+        });
     </script>
 </body>
 

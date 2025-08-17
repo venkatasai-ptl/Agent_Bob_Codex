@@ -14,7 +14,7 @@ load_dotenv()  # Load environment variables from .env file
 
 app = Flask(__name__, template_folder='../templates')
 # Generate a random secret key for session management
-app.secret_key = os.urandom(24)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret") 
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ---------------------------
@@ -51,8 +51,37 @@ def stream_llm_tokens(text):
             yield token
 
 def get_session_id():
-    """Return current session id or 'default' if none set."""
-    return session.get("session_id", "default")
+    """
+    Return current session id from (in order):
+      1) X-Session-Id header
+      2) JSON body 'session_id'
+      3) form field 'session_id'
+      4) Flask session cookie
+    Raise if none found.
+    """
+    # 1) Header
+    sid = request.headers.get('X-Session-Id')
+    if sid:
+        return sid
+
+    # 2) JSON body
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        sid = data.get('session_id')
+        if sid:
+            return sid
+
+    # 3) Form field (multipart or urlencoded)
+    sid = request.form.get('session_id')
+    if sid:
+        return sid
+
+    # 4) Cookie (fallback)
+    sid = session.get('session_id')
+    if sid:
+        return sid
+
+    raise RuntimeError("No active session. Provide session_id or call /start-session first.")
 
 def get_chat_file(session_id: str) -> str:
     """Ensure session dir exists and return path to its chat.json file."""
@@ -108,6 +137,14 @@ def process_audio():
 
     if 'audio' not in request.files:
         return jsonify({"error": "No audio file"}), 400
+    
+    # Require an active session; do not default to 'default'
+    try:
+        current_session_id = get_session_id()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+
+    print(f"Using session ID for chat history: {current_session_id}")
 
     audio_file = request.files['audio']
     unique_id, now = make_ids()
@@ -143,14 +180,20 @@ def process_audio():
         with open(response_filename, 'w', encoding='utf-8') as f:
             f.write(full_response)
 
-        # Save turn to chat history
+
+        # Debug output
+        print(f"Using session ID for chat history: {current_session_id}")
+        
+        # Save turn to chat history in the specific session directory
         append_chat_history(
-            get_session_id(),
+            current_session_id,
             human_ts_from_slug(slug),
             text,             # user input (transcript)
             full_response     # assistant output
         )
-
+        
+        # Debug output
+        print(f"Saved chat history for session: {current_session_id}")
 
         # Announce completion to clients
         socketio.emit('complete')
@@ -192,19 +235,47 @@ def start_session():
     # Store session ID in Flask session
     session['session_id'] = session_id
 
+    # Also persist the "current" session id for non-cookie clients
+    ensure_dirs()
+    with open('data/last_session_id.txt', 'w', encoding='utf-8') as f:
+        f.write(session_id)
+
     return jsonify({
         "status": "success",
         "session_id": session_id,
         "message": "Session started successfully"
     })
 
+@app.route('/active-session', methods=['GET'])
+def active_session():
+    """
+    Return the latest known session_id for non-cookie clients (like audio_capture.py).
+    Prefers the cookie session if available, else falls back to data/last_session_id.txt.
+    """
+    # 1) try cookie-backed Flask session
+    sid = session.get('session_id')
+    if sid:
+        return jsonify({"session_id": sid})
+
+    # 2) fallback to last written session id
+    try:
+        with open('data/last_session_id.txt', 'r', encoding='utf-8') as f:
+            sid = f.read().strip()
+    except Exception:
+        sid = None
+
+    if not sid:
+        return jsonify({"error": "No active session"}), 404
+
+    return jsonify({"session_id": sid})
+
 @app.route('/get_chat_history', methods=['GET'])
 def get_chat_history():
-    """
-    Return the chat history for the current session.
-    Shape: [{timestamp, user, assistant}, ...]
-    """
-    session_id = get_session_id()
+    try:
+        session_id = get_session_id()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+    
     chat_file = get_chat_file(session_id)
 
     history = []
@@ -234,4 +305,4 @@ def handle_connect():
 
 if __name__ == '__main__':
     # debug=True is fine for development, but make sure to configure properly for production.
-    socketio.run(app, debug=True)
+    socketio.run(app, debug=True, use_reloader=False)
