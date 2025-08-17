@@ -116,6 +116,76 @@ def append_chat_history(session_id: str, timestamp: str, user_text: str, assista
     with open(chat_file, 'w', encoding='utf-8') as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def build_messages_text(session_id: str, transcript: str, max_turns: int = 5) -> str:
+    """
+    Assemble the full user message with:
+      - [CONTEXT] resume + job description (from session files)
+      - [CHAT_HISTORY] last N turns from chat.json
+      - [NEW_PROMPT] the fresh transcript
+      - [OUTPUT_INSTRUCTIONS] interview style guardrails
+    """
+    session_dir = f"data/sessions/{session_id}"
+    resume_path = os.path.join(session_dir, "resume.txt")
+    jd_path = os.path.join(session_dir, "job_description.txt")
+    chat_file = get_chat_file(session_id)
+
+    # Load resume/JD
+    resume = ""
+    if os.path.exists(resume_path):
+        with open(resume_path, encoding="utf-8") as f:
+            resume = f.read()
+
+    jd = ""
+    if os.path.exists(jd_path):
+        with open(jd_path, encoding="utf-8") as f:
+            jd = f.read()
+
+    # Load last N turns of chat history
+    history = []
+    if os.path.exists(chat_file):
+        try:
+            with open(chat_file, 'r', encoding='utf-8') as f:
+                history = json.load(f) or []
+        except Exception:
+            history = []
+
+    # Chronological last N turns
+    history_sorted = sorted(history, key=lambda t: t.get("timestamp", ""))[-max_turns:]
+    hist_lines = []
+    for t in history_sorted:
+        q = (t.get("user") or "").strip()
+        a = (t.get("assistant") or "").strip()
+        if q or a:
+            hist_lines.append(f"- Q: {q}\n  A: {a}")
+    hist_block = "\n".join(hist_lines) if hist_lines else "(none)"
+
+    return f"""[CONTEXT]
+RESUME:
+{resume}
+
+JOB_DESCRIPTION:
+{jd}
+
+[CHAT_HISTORY_LAST_{max_turns}_TURNS]
+{hist_block}
+
+[NEW_PROMPT]
+You are answering the interviewer’s last question based on the transcript below.
+
+TRANSCRIPT:
+{transcript}
+
+[OUTPUT_INSTRUCTIONS]
+- Speak as me, in first person.
+- Be concise and confident. No fluff or hedging. No invented facts (no fake names/dates/employers).
+- Use STAR when helpful; quantify impact (metrics, scale, tools) if available.
+- If details are missing, keep them generic but realistic.
+- End with one-line takeaway.
+
+Return a clean answer. If STAR doesn’t fully apply, answer plainly without inventing details.
+"""
+
+
 
 # ---------------------------
 # Routes
@@ -169,9 +239,23 @@ def process_audio():
         # Prepare response file path
         response_filename = f"data/responses/{slug}_{unique_id}.txt"
 
+        # Build full prompt with resume + JD + short history + transcript
+        messages_text = build_messages_text(current_session_id, text, max_turns=5)
+
+        # Save the exact prompt given to LLM
+        prompt_filename = f"data/prompts/{slug}_{unique_id}.json"
+        os.makedirs("data/prompts", exist_ok=True)
+        with open(prompt_filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                "timestamp": human_ts_from_slug(slug),
+                "session_id": current_session_id,
+                "transcript": text,
+                "prompt": messages_text
+            }, f, ensure_ascii=False, indent=2)
+
         # Iterate tokens once: emit via WebSocket and buffer in memory
         response_buffer = []
-        for token in stream_llm_tokens(text):
+        for token in stream_llm_tokens(messages_text):
             response_buffer.append(token)
             socketio.emit('token', {'token': token})
 
