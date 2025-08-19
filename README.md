@@ -33,7 +33,7 @@ echo "OPENAI_API_KEY=your-api-key-here" > .env
 ```
 
 ## Usage
-Start the application:
+Start the server:
 ```bash
 python run.py
 ```
@@ -58,20 +58,18 @@ Agent_Bob/
 │   └── transcripts/      # Text transcripts
 ├── src/                  # Source code
 │   ├── app.py            # Flask application
-│   ├── audio_capture.py  # Audio recorder
+│   ├── audio_capture.py  # Audio recorder (legacy)
 │   ├── llm.py            # Response generator
 │   └── transcribe.py     # Audio-to-text
 ├── templates/            # Web interface
 │   └── index.html
 ├── .env                  # API key configuration
 ├── requirements.txt      # Dependencies
-└── run.py                # Control script
+└── run.py                # Flask server launcher
 ```
 
 ## Configuration
 - Set `OPENAI_API_KEY` in `.env`
-- Modify `audio_capture.py` for audio device settings
-- Adjust VAD sensitivity in `audio_capture.py` (VAD_AGGRESSIVENESS)
 
 ## Notes
 - Requires "Stereo Mix" enabled in Windows sound settings
