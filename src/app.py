@@ -12,7 +12,7 @@ import json
 
 load_dotenv()  # Load environment variables from .env file
 
-app = Flask(__name__, template_folder='../templates')
+app = Flask(__name__, template_folder='../templates', static_folder='../static')
 # Generate a random secret key for session management
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret") 
 socketio = SocketIO(app, cors_allowed_origins="*")
