@@ -4,4 +4,6 @@ python-dotenv
 pyaudiowpatch
 webrtcvad
 flask-socketio
+flask-sock
 requests
+
