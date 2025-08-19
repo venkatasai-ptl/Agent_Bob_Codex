@@ -111,10 +111,12 @@
 
     <div class="status" id="status">Idle</div>
 
-    <!-- Recording Controls -->
+    <!-- Audio Capture Controls -->
     <div>
-        <button id="startRecording" class="btn">Start Recording</button>
-        <button id="stopRecording" class="btn" disabled>Stop Recording</button>
+        <button id="btnMic" class="btn">Mic</button>
+        <button id="btnTab" class="btn">Tab</button>
+        <button id="btnScreen" class="btn">Screen</button>
+        <button id="btnStop" class="btn" disabled>Stop</button>
     </div>
 
     <!-- Current Response Section -->
@@ -146,11 +148,15 @@
         const statusDiv = document.getElementById('status');
         const submitTextButton = document.getElementById('submitText');
         const sessionPill = document.getElementById('sessionPill');
-        const startRecordButton = document.getElementById('startRecording');
-        const stopRecordButton = document.getElementById('stopRecording');
+        const btnMic = document.getElementById('btnMic');
+        const btnTab = document.getElementById('btnTab');
+        const btnScreen = document.getElementById('btnScreen');
+        const btnStop = document.getElementById('btnStop');
 
-        let mediaRecorder = null;
-        let audioChunks = [];
+        let ws = null;
+        let stream = null;
+        let audioCtx = null;
+        let pcmNode = null;
 
         // Simple XSS-safe text escape
         function escapeHtml(s) {
@@ -238,87 +244,82 @@
             fetchChatHistory(); // refresh history after each response
         });
 
-        async function startRecording() {
+        async function startCapture(kind) {
             if (!SESSION_ID) {
                 alert('Start a session first.');
                 return;
             }
             try {
-                startRecordButton.disabled = true;
-                stopRecordButton.disabled = false;
-                statusDiv.textContent = 'Recording...';
+                btnMic.disabled = true;
+                btnTab.disabled = true;
+                btnScreen.disabled = true;
+                btnStop.disabled = false;
+                statusDiv.textContent = 'Capturing...';
 
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
-                audioChunks = [];
-                mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
-                mediaRecorder.onstop = handleRecordingStop;
-                mediaRecorder.start();
+                if (kind === 'mic') {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } else if (kind === 'tab') {
+                    stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true, preferCurrentTab: true });
+                } else if (kind === 'screen') {
+                    stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
+                }
 
-                // Silence detection via Web Audio API
-                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.createMediaStreamSource(stream);
-                const analyser = audioContext.createAnalyser();
-                source.connect(analyser);
-                const dataArray = new Uint8Array(analyser.fftSize);
-                let silenceMs = 0;
-                const checkSilence = () => {
-                    analyser.getByteTimeDomainData(dataArray);
-                    let sum = 0;
-                    for (let i = 0; i < dataArray.length; i++) {
-                        const v = dataArray[i] - 128;
-                        sum += v * v;
-                    }
-                    const rms = Math.sqrt(sum / dataArray.length);
-                    if (rms < 10) {
-                        silenceMs += 200;
-                        if (silenceMs > 1500 && mediaRecorder && mediaRecorder.state === 'recording') {
-                            mediaRecorder.stop();
-                        }
-                    } else {
-                        silenceMs = 0;
-                    }
-                    if (mediaRecorder && mediaRecorder.state === 'recording') {
-                        setTimeout(checkSilence, 200);
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                await audioCtx.audioWorklet.addModule('/static/pcm_collector.js');
+                const source = audioCtx.createMediaStreamSource(stream);
+                pcmNode = new AudioWorkletNode(audioCtx, 'pcm_collector');
+                pcmNode.port.onmessage = (e) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(e.data);
                     }
                 };
-                checkSilence();
+                source.connect(pcmNode);
+                pcmNode.connect(audioCtx.destination);
+
+                const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+                ws = new WebSocket(`${proto}://${location.host}/ws-audio`);
+                ws.binaryType = 'arraybuffer';
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({ sample_rate: audioCtx.sampleRate, session_id: SESSION_ID }));
+                };
+                ws.onclose = () => {
+                    statusDiv.textContent = 'Connection closed';
+                };
             } catch (err) {
-                console.error('Recording error:', err);
+                console.error('Capture error:', err);
                 statusDiv.textContent = `Error: ${err.message}`;
-                startRecordButton.disabled = false;
-                stopRecordButton.disabled = true;
+                stopCapture();
             }
         }
 
-        function stopRecording() {
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-                mediaRecorder.stop();
+        function stopCapture() {
+            if (ws) {
+                try { ws.close(); } catch (_) {}
+                ws = null;
             }
+            if (pcmNode) {
+                pcmNode.disconnect();
+                pcmNode = null;
+            }
+            if (audioCtx) {
+                audioCtx.close();
+                audioCtx = null;
+            }
+            if (stream) {
+                stream.getTracks().forEach(t => t.stop());
+                stream = null;
+            }
+            btnMic.disabled = false;
+            btnTab.disabled = false;
+            btnScreen.disabled = false;
+            btnStop.disabled = true;
+            statusDiv.textContent = 'Idle';
         }
 
-        async function handleRecordingStop() {
-            stopRecordButton.disabled = true;
-            startRecordButton.disabled = false;
-            statusDiv.textContent = 'Uploading...';
-            const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-            const formData = new FormData();
-            formData.append('audio', blob, 'recording.webm');
-            if (SESSION_ID) {
-                formData.append('session_id', SESSION_ID);
-            }
-            try {
-                const res = await fetch('/process', { method: 'POST', body: formData });
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                statusDiv.textContent = 'Audio sent!';
-            } catch (err) {
-                console.error('Upload failed:', err);
-                statusDiv.textContent = `Upload failed: ${err.message}`;
-            }
-        }
-
-        startRecordButton.addEventListener('click', startRecording);
-        stopRecordButton.addEventListener('click', stopRecording);
+        btnMic.addEventListener('click', () => startCapture('mic'));
+        btnTab.addEventListener('click', () => startCapture('tab'));
+        btnScreen.addEventListener('click', () => startCapture('screen'));
+        btnStop.addEventListener('click', stopCapture);
 
         // Start Session
         submitTextButton.addEventListener('click', async () => {
