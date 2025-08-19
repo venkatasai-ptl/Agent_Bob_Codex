@@ -7,6 +7,11 @@ import glob
 from transcribe import transcribe_audio
 from llm import get_llm_response
 from flask_socketio import SocketIO, emit
+from flask_sock import Sock
+from simple_websocket import ConnectionClosed
+import webrtcvad
+import wave
+import time
 import json
 
 
@@ -14,8 +19,9 @@ load_dotenv()  # Load environment variables from .env file
 
 app = Flask(__name__, template_folder='../templates', static_folder='../static')
 # Generate a random secret key for session management
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret") 
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret")
 socketio = SocketIO(app, cors_allowed_origins="*")
+sock = Sock(app)
 
 # ---------------------------
 # Helpers (deduped utilities)
@@ -194,6 +200,121 @@ Return a clean answer. If STAR doesn’t fully apply, answer plainly without inv
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+# ---------------------------
+# WebSocket audio route
+# ---------------------------
+
+@sock.route('/ws-audio')
+def ws_audio(ws):
+    """Receive PCM audio over WebSocket, transcribe, and stream LLM tokens."""
+    try:
+        hello_msg = ws.receive()
+        if hello_msg is None:
+            return
+        hello = json.loads(hello_msg)
+        session_id = hello.get('session_id')
+        sample_rate = int(hello.get('sample_rate', 16000))
+        frame_ms = int(hello.get('frame_ms', 30))
+    except Exception:
+        return
+
+    vad = webrtcvad.Vad(2)
+    bytes_per_frame = int(sample_rate * frame_ms / 1000) * 2
+    max_silence_frames = max(1, int(1000 / frame_ms))
+    INACTIVITY_TIMEOUT = 5.0
+
+    while True:
+        audio_buf = bytearray()
+        silence_frames = 0
+        last_frame_time = time.time()
+        closed = False
+
+        while True:
+            try:
+                frame = ws.receive(timeout=1)
+            except ConnectionClosed:
+                closed = True
+                break
+
+            if frame is None:
+                if time.time() - last_frame_time > INACTIVITY_TIMEOUT:
+                    closed = True
+                    break
+                continue
+
+            if isinstance(frame, str):
+                continue
+
+            audio_buf.extend(frame)
+            last_frame_time = time.time()
+
+            if len(frame) == bytes_per_frame and vad.is_speech(frame, sample_rate):
+                silence_frames = 0
+            else:
+                silence_frames += 1
+
+            if silence_frames >= max_silence_frames:
+                break
+
+        if not audio_buf:
+            break
+
+        unique_id, now = make_ids()
+        slug = ts_slug(now)
+        ensure_dirs()
+        recording_filename = f"data/recordings/{slug}_{unique_id}.wav"
+        with wave.open(recording_filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(bytes(audio_buf))
+
+        try:
+            text = transcribe_audio(recording_filename)
+        except Exception:
+            break
+
+        transcript_filename = f"data/transcripts/{slug}_{unique_id}.txt"
+        with open(transcript_filename, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+        socketio.emit('clear')
+
+        response_filename = f"data/responses/{slug}_{unique_id}.txt"
+        messages_text = build_messages_text(session_id, text, max_turns=5)
+
+        prompt_filename = f"data/prompts/{slug}_{unique_id}.json"
+        os.makedirs("data/prompts", exist_ok=True)
+        with open(prompt_filename, 'w', encoding='utf-8') as f:
+            json.dump({
+                "timestamp": human_ts_from_slug(slug),
+                "session_id": session_id,
+                "transcript": text,
+                "prompt": messages_text
+            }, f, ensure_ascii=False, indent=2)
+
+        response_buffer = []
+        for token in stream_llm_tokens(messages_text):
+            response_buffer.append(token)
+            socketio.emit('token', {'token': token})
+
+        full_response = ''.join(response_buffer)
+        with open(response_filename, 'w', encoding='utf-8') as f:
+            f.write(full_response)
+
+        append_chat_history(
+            session_id,
+            human_ts_from_slug(slug),
+            text,
+            full_response
+        )
+
+        socketio.emit('complete')
+
+        if closed:
+            break
 
 
 @app.route('/process', methods=['POST'])
