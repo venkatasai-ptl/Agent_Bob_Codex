@@ -109,7 +109,13 @@
         <button id="submitText" class="btn">Start Session</button>
     </div>
 
-    <div class="status" id="status">Listening for system audio...</div>
+    <div class="status" id="status">Idle</div>
+
+    <!-- Recording Controls -->
+    <div>
+        <button id="startRecording" class="btn">Start Recording</button>
+        <button id="stopRecording" class="btn" disabled>Stop Recording</button>
+    </div>
 
     <!-- Current Response Section -->
     <div class="current-response">
@@ -140,6 +146,11 @@
         const statusDiv = document.getElementById('status');
         const submitTextButton = document.getElementById('submitText');
         const sessionPill = document.getElementById('sessionPill');
+        const startRecordButton = document.getElementById('startRecording');
+        const stopRecordButton = document.getElementById('stopRecording');
+
+        let mediaRecorder = null;
+        let audioChunks = [];
 
         // Simple XSS-safe text escape
         function escapeHtml(s) {
@@ -226,6 +237,88 @@
             statusDiv.textContent = 'Response complete!';
             fetchChatHistory(); // refresh history after each response
         });
+
+        async function startRecording() {
+            if (!SESSION_ID) {
+                alert('Start a session first.');
+                return;
+            }
+            try {
+                startRecordButton.disabled = true;
+                stopRecordButton.disabled = false;
+                statusDiv.textContent = 'Recording...';
+
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+                mediaRecorder.onstop = handleRecordingStop;
+                mediaRecorder.start();
+
+                // Silence detection via Web Audio API
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(stream);
+                const analyser = audioContext.createAnalyser();
+                source.connect(analyser);
+                const dataArray = new Uint8Array(analyser.fftSize);
+                let silenceMs = 0;
+                const checkSilence = () => {
+                    analyser.getByteTimeDomainData(dataArray);
+                    let sum = 0;
+                    for (let i = 0; i < dataArray.length; i++) {
+                        const v = dataArray[i] - 128;
+                        sum += v * v;
+                    }
+                    const rms = Math.sqrt(sum / dataArray.length);
+                    if (rms < 10) {
+                        silenceMs += 200;
+                        if (silenceMs > 1500 && mediaRecorder && mediaRecorder.state === 'recording') {
+                            mediaRecorder.stop();
+                        }
+                    } else {
+                        silenceMs = 0;
+                    }
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        setTimeout(checkSilence, 200);
+                    }
+                };
+                checkSilence();
+            } catch (err) {
+                console.error('Recording error:', err);
+                statusDiv.textContent = `Error: ${err.message}`;
+                startRecordButton.disabled = false;
+                stopRecordButton.disabled = true;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+        }
+
+        async function handleRecordingStop() {
+            stopRecordButton.disabled = true;
+            startRecordButton.disabled = false;
+            statusDiv.textContent = 'Uploading...';
+            const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+            const formData = new FormData();
+            formData.append('audio', blob, 'recording.webm');
+            if (SESSION_ID) {
+                formData.append('session_id', SESSION_ID);
+            }
+            try {
+                const res = await fetch('/process', { method: 'POST', body: formData });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                statusDiv.textContent = 'Audio sent!';
+            } catch (err) {
+                console.error('Upload failed:', err);
+                statusDiv.textContent = `Upload failed: ${err.message}`;
+            }
+        }
+
+        startRecordButton.addEventListener('click', startRecording);
+        stopRecordButton.addEventListener('click', stopRecording);
 
         // Start Session
         submitTextButton.addEventListener('click', async () => {
