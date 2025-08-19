@@ -333,7 +333,7 @@ def start_session():
 @app.route('/active-session', methods=['GET'])
 def active_session():
     """
-    Return the latest known session_id for non-cookie clients (like audio_capture.py).
+    Return the latest known session_id for non-cookie clients.
     Prefers the cookie session if available, else falls back to data/last_session_id.txt.
     """
     # 1) try cookie-backed Flask session
