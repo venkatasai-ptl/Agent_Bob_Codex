@@ -4,10 +4,12 @@ from dotenv import load_dotenv
 from datetime import datetime
 import uuid
 import glob
+import base64
 from transcribe import transcribe_audio
 from llm import get_llm_response
 from flask_socketio import SocketIO, emit
 import json
+from buffer_manager import BufferManager
 
 
 load_dotenv()  # Load environment variables from .env file
@@ -16,6 +18,7 @@ app = Flask(__name__, template_folder='../templates')
 # Generate a random secret key for session management
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret") 
 socketio = SocketIO(app, cors_allowed_origins="*")
+buffers = {}
 
 # ---------------------------
 # Helpers (deduped utilities)
@@ -41,6 +44,75 @@ def ensure_dirs():
     os.makedirs('data/transcripts', exist_ok=True)
     os.makedirs('data/responses', exist_ok=True)
     os.makedirs('data/sessions', exist_ok=True)
+
+
+def process_recording(recording_filename: str, session_id: str, slug: str | None = None, unique_id: str | None = None):
+    """Transcribe audio, stream LLM tokens and save artifacts."""
+    ensure_dirs()
+    if slug is None or unique_id is None:
+        unique_id, now = make_ids()
+        slug = ts_slug(now)
+
+    text = transcribe_audio(recording_filename)
+
+    transcript_filename = f"data/transcripts/{slug}_{unique_id}.txt"
+    with open(transcript_filename, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+    socketio.emit('clear')
+
+    response_filename = f"data/responses/{slug}_{unique_id}.txt"
+
+    messages_text = build_messages_text(session_id, text, max_turns=5)
+
+    prompt_filename = f"data/prompts/{slug}_{unique_id}.json"
+    os.makedirs("data/prompts", exist_ok=True)
+    with open(prompt_filename, 'w', encoding='utf-8') as f:
+        json.dump({
+            "timestamp": human_ts_from_slug(slug),
+            "session_id": session_id,
+            "transcript": text,
+            "prompt": messages_text
+        }, f, ensure_ascii=False, indent=2)
+
+    response_buffer = []
+    for token in stream_llm_tokens(messages_text):
+        response_buffer.append(token)
+        socketio.emit('token', {'token': token})
+
+    full_response = ''.join(response_buffer)
+    with open(response_filename, 'w', encoding='utf-8') as f:
+        f.write(full_response)
+
+    append_chat_history(
+        session_id,
+        human_ts_from_slug(slug),
+        text,
+        full_response
+    )
+
+    socketio.emit('complete')
+
+    return {
+        "status": "success",
+        "recording_file": recording_filename,
+        "transcript_file": transcript_filename,
+        "response_file": response_filename,
+        "timestamp": human_ts_from_slug(slug)
+    }
+
+
+def handle_buffer_complete(session_id: str, wav_path: str) -> None:
+    """Callback from BufferManager when a segment is ready."""
+    unique_id, now = make_ids()
+    slug = ts_slug(now)
+    recording_filename = f"data/recordings/{slug}_{unique_id}.wav"
+    os.makedirs('data/recordings', exist_ok=True)
+    os.replace(wav_path, recording_filename)
+    try:
+        process_recording(recording_filename, session_id, slug, unique_id)
+    except Exception as e:
+        print(f"Error processing buffered audio: {e}")
 
 def stream_llm_tokens(text):
     """
@@ -218,78 +290,12 @@ def process_audio():
 
     audio_file = request.files['audio']
     unique_id, now = make_ids()
-    slug = ts_slug(now)  # YYYYMMDD_HHMMSS
-
-    # Save recording
+    slug = ts_slug(now)
     recording_filename = f"data/recordings/{slug}_{unique_id}.wav"
     audio_file.save(recording_filename)
-
     try:
-        # Transcribe audio
-        text = transcribe_audio(recording_filename)
-
-        # Save transcript
-        transcript_filename = f"data/transcripts/{slug}_{unique_id}.txt"
-        with open(transcript_filename, 'w', encoding='utf-8') as f:
-            f.write(text)
-
-        # Clear previous output in UI
-        socketio.emit('clear')
-
-        # Prepare response file path
-        response_filename = f"data/responses/{slug}_{unique_id}.txt"
-
-        # Build full prompt with resume + JD + short history + transcript
-        messages_text = build_messages_text(current_session_id, text, max_turns=5)
-
-        # Save the exact prompt given to LLM
-        prompt_filename = f"data/prompts/{slug}_{unique_id}.json"
-        os.makedirs("data/prompts", exist_ok=True)
-        with open(prompt_filename, 'w', encoding='utf-8') as f:
-            json.dump({
-                "timestamp": human_ts_from_slug(slug),
-                "session_id": current_session_id,
-                "transcript": text,
-                "prompt": messages_text
-            }, f, ensure_ascii=False, indent=2)
-
-        # Iterate tokens once: emit via WebSocket and buffer in memory
-        response_buffer = []
-        for token in stream_llm_tokens(messages_text):
-            response_buffer.append(token)
-            socketio.emit('token', {'token': token})
-
-        # Write the full response exactly once at the end
-        full_response = ''.join(response_buffer)
-        with open(response_filename, 'w', encoding='utf-8') as f:
-            f.write(full_response)
-
-
-        # Debug output
-        print(f"Using session ID for chat history: {current_session_id}")
-        
-        # Save turn to chat history in the specific session directory
-        append_chat_history(
-            current_session_id,
-            human_ts_from_slug(slug),
-            text,             # user input (transcript)
-            full_response     # assistant output
-        )
-        
-        # Debug output
-        print(f"Saved chat history for session: {current_session_id}")
-
-        # Announce completion to clients
-        socketio.emit('complete')
-
-        return jsonify({
-            "status": "success",
-            "recording_file": recording_filename,
-            "transcript_file": transcript_filename,
-            "response_file": response_filename,
-            "timestamp": human_ts_from_slug(slug)
-        }), 200
-
+        result = process_recording(recording_filename, current_session_id, slug, unique_id)
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -378,6 +384,27 @@ def get_chat_history():
 # ---------------------------
 # Socket.IO events
 # ---------------------------
+
+@socketio.on('audio_frame')
+def handle_audio_frame(data):
+    session_id = data.get('session_id')
+    frame_b64 = data.get('frame')
+    if not session_id or not frame_b64:
+        return
+    frame = base64.b64decode(frame_b64)
+    bm = buffers.get(session_id)
+    if bm is None:
+        bm = BufferManager(session_id, handle_buffer_complete)
+        buffers[session_id] = bm
+    bm.add_frame(frame)
+
+
+@socketio.on('audio_stop')
+def handle_audio_stop(data):
+    session_id = data.get('session_id')
+    bm = buffers.get(session_id)
+    if bm:
+        bm.flush()
 
 @socketio.on('connect')
 def handle_connect():
